@@ -1,0 +1,8 @@
+__pycache__/
+debug_*.png
+test_qr.py
+test_account.json
+upi_qr.png
+__checkout_session.json
+*.pyc
+.venv/
