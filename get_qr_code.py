@@ -12,6 +12,7 @@ ChatGPT Plus UPI 全自动支付脚本
     python get_qr_code.py
 """
 
+import argparse
 import json
 import base64
 import uuid
@@ -36,6 +37,8 @@ try:
     HAS_PLAYWRIGHT = True
 except ImportError:
     HAS_PLAYWRIGHT = False
+    Page = "Page"   # type: ignore[assignment,misc]
+    Route = "Route" # type: ignore[assignment,misc]
 
 
 CHECKOUT_API = "https://chatgpt.com/backend-api/payments/checkout"
@@ -227,10 +230,21 @@ class StripeBrowserAutomator:
         captured = {}
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=self.headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            launch_kwargs = {
+                "headless": self.headless,
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
+            chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            import os as _os
+            if _os.path.exists(chrome_path):
+                launch_kwargs["executable_path"] = chrome_path
+            try:
+                browser = p.chromium.launch(**launch_kwargs)
+            except Exception:
+                browser = p.chromium.launch(
+                    headless=self.headless,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
             context = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -495,34 +509,97 @@ def parse_account_json(raw: str) -> dict:
     raise ValueError("无法解析账户 JSON 或 JWT token")
 
 
-def main():
-    saved_session = Path("__checkout_session.json")
-
-    # ================================================
-    # 1. 加载账户 JSON
-    # ================================================
-    account_path = os.environ.get("ACCOUNT_JSON", "")
-    if not account_path:
-        candidates = [f for f in Path(".").iterdir() if f.suffix == ".json" and f.stem != "__checkout_session"]
-        if candidates:
-            account_path = str(candidates[0])
-            print(f"[*] 自动检测到账户文件: {account_path}")
-        else:
-            print("用法之一: set ACCOUNT_JSON=account.json && python get_qr_code.py")
-            print("或直接将 JSON 文件放到当前目录。")
-            sys.exit(1)
-
-    with open(account_path, "r", encoding="utf-8") as f:
-        account = parse_account_json(f.read())
-
+def _load_token_file(path: str) -> str:
+    """从 session JSON 文件中提取 accessToken"""
+    with open(path, "r", encoding="utf-8-sig") as f:
+        raw = f.read()
+    account = parse_account_json(raw)
     token = account.get("accessToken") or account.get("access_token") or ""
+    if not token:
+        raise ValueError(f"文件 {path} 中未找到 accessToken")
+    return token, account
+
+
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="ChatGPT Plus UPI 全自动支付脚本",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  python get_qr_code.py --token-from-file session.json\n"
+            "  python get_qr_code.py --token eyJhbGciOi...\n"
+            "  python get_qr_code.py --token-from-file session.json --plan team\n"
+            '  $env:ACCOUNT_JSON="session.json"; python get_qr_code.py\n'
+        ),
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--token-from-file", "-f", metavar="PATH",
+                   help="从 session JSON 文件读取 accessToken")
+    g.add_argument("--token", "-t", metavar="JWT",
+                   help="直接传入 accessToken 字符串")
+    p.add_argument("--plan", choices=["plus", "team"], default="plus",
+                   help="订阅计划 (默认: plus)")
+    p.add_argument("--proxy", default="",
+                   help="HTTP(S) 代理地址，如 http://127.0.0.1:7890")
+    p.add_argument("--headless", action="store_true", default=False,
+                   help="无头模式运行浏览器 (默认: 有头，可观察)")
+    p.add_argument("--no-browser", action="store_true",
+                   help="仅创建 checkout session，不启动浏览器 (只输出支付链接)")
+    p.add_argument("--out", default="upi_qr.png",
+                   help="QR 码图片输出路径 (默认: upi_qr.png)")
+    p.add_argument("--reuse", action="store_true", default=True,
+                   help="复用已缓存的 checkout session (默认开启)")
+    p.add_argument("--no-reuse", dest="reuse", action="store_false",
+                   help="不使用缓存，强制重新创建 checkout session")
+    return p
+
+
+def main():
+    parser = _build_argparser()
+    args = parser.parse_args()
+
+    # ================================================
+    # 1. 获取 token (优先级: CLI > 环境变量 > 自动检测)
+    # ================================================
+    token = ""
+    account: dict = {}
+
+    if args.token:
+        token = args.token
+        print("[*] 使用命令行传入的 token")
+    elif args.token_from_file:
+        token, account = _load_token_file(args.token_from_file)
+        print(f"[*] 从文件加载 token: {args.token_from_file}")
+    else:
+        account_path = os.environ.get("ACCOUNT_JSON", "")
+        if not account_path:
+            candidates = [
+                f for f in Path(".").iterdir()
+                if f.suffix == ".json"
+                and f.stem != "__checkout_session"
+                and not f.name.startswith(".")
+            ]
+            if candidates:
+                account_path = str(candidates[0])
+                print(f"[*] 自动检测到账户文件: {account_path}")
+            else:
+                parser.print_help()
+                print("\n[!] 未提供 token。请使用 --token-from-file 或 --token，"
+                      "或设置 ACCOUNT_JSON 环境变量，或将 session JSON 放到当前目录。")
+                sys.exit(1)
+        token, account = _load_token_file(account_path)
+
     if not token:
         print("[!] 未找到 accessToken")
         sys.exit(1)
 
     user_name = account.get("user", {}).get("name", "")
     user_email = account.get("user", {}).get("email", "")
-    print(f"[*] 账户: {user_name or '(unknown)'} <{user_email or '(no email)'}>")
+    plan_type = account.get("account", {}).get("planType", "")
+    if user_name or user_email:
+        print(f"[*] 账户: {user_name or '(unknown)'} <{user_email or '(no email)'}>  当前计划: {plan_type or '?'}")
+
+    proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
 
     # ================================================
     # 2. 生成虚拟人物 + 创建 checkout session
@@ -531,26 +608,48 @@ def main():
     person = pool.generate()
     print(f"[*] 虚拟身份: {person['name']}, {person['city']}, {person['state']}")
 
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
+    saved_session = Path("__checkout_session.json")
 
-    if saved_session.exists():
+    sess = None
+    if args.reuse and saved_session.exists():
         print("[*] 复用已缓存的 checkout session...")
-        sess = json.loads(saved_session.read_text())
-        pay_url = sess.get("url", "")
-        if pay_url and "cs_live_" in pay_url:
-            print(f"[*] 支付链接: {pay_url}")
-        else:
-            saved_session.unlink()
+        try:
+            sess = json.loads(saved_session.read_text(encoding="utf-8"))
+        except Exception:
             sess = None
-    else:
-        sess = None
 
-    if not sess:
-        print("[*] 调用 ChatGPT API 创建 checkout session...")
-        sess = ChatGPTCheckout.create(token, proxy)
-        saved_session.write_text(json.dumps(sess, indent=2))
+    if sess:
         pay_url = sess.get("url", "")
-        print(f"[*] 支付链接: {pay_url}")
+        if not pay_url or "cs_live_" not in pay_url:
+            print("[!] 缓存的 session 无效，重新创建...")
+            sess = None
+
+    if sess is None:
+        print(f"[*] 调用 ChatGPT API 创建 checkout session (plan={args.plan})...")
+        try:
+            sess = ChatGPTCheckout.create(token, proxy, plan=args.plan)
+        except Exception as exc:
+            print(f"[!] 创建 checkout session 失败: {exc}")
+            sys.exit(1)
+        saved_session.write_text(json.dumps(sess, indent=2), encoding="utf-8")
+
+    pay_url = sess.get("url", "")
+    session_id = sess.get("checkout_session_id") or sess.get("session_id") or ""
+    print(f"[*] 支付链接: {pay_url}")
+    if session_id:
+        print(f"[*] Session ID: {session_id}")
+
+    # --no-browser: 只输出链接，不启动浏览器
+    if args.no_browser:
+        print("\n[✓] 仅输出模式，不启动浏览器。")
+        print(f"    支付链接: {pay_url}")
+        result = {
+            "url": pay_url,
+            "session_id": session_id,
+            "session": sess,
+        }
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
 
     # ================================================
     # 3. Playwright 浏览器自动化 → 获取 QR
@@ -559,23 +658,30 @@ def main():
         print("[!] 未能获取到有效的支付链接")
         sys.exit(1)
 
-    print(f"[*] 启动浏览器，打开支付页面...")
-    automator = StripeBrowserAutomator(headless=False, timeout=90)
+    if not HAS_PLAYWRIGHT:
+        print("[!] 未安装 playwright，无法自动提取 QR 码。")
+        print("    请手动打开支付链接完成支付:")
+        print(f"    {pay_url}")
+        print("    安装: pip install playwright && playwright install chromium")
+        sys.exit(0)
+
+    print(f"[*] 启动浏览器 (headless={args.headless})，打开支付页面...")
+    automator = StripeBrowserAutomator(headless=args.headless, timeout=90)
 
     qr_bytes, captured = automator.run(pay_url, person)
 
     if qr_bytes:
-        out = "upi_qr.png"
-        with open(out, "wb") as f:
+        with open(args.out, "wb") as f:
             f.write(qr_bytes)
-        print(f"\n[✓] QR 码已保存: {out} ({len(qr_bytes)} bytes)")
-        print("[✓] 请用 UPI 应用扫描完成支付。")
+        print(f"\n[OK] QR 码已保存: {args.out} ({len(qr_bytes)} bytes)")
+        print("[OK] 请用 UPI 应用扫描完成支付。")
     else:
         print("\n[!] 未能提取到 QR 码")
         if captured:
             print(f"    payment_intent.status: {captured.get('pi_status', '?')}")
             print(f"    payment_intent.id:     {captured.get('pi_id', '?')}")
         print("[!] 请检查浏览器窗口，手动完成支付流程。")
+        print(f"    支付链接: {pay_url}")
 
 
 if __name__ == "__main__":

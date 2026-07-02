@@ -6,3 +6,7 @@ upi_qr.png
 __checkout_session.json
 *.pyc
 .venv/
+reverse-skill/
+session.json
+*_session.json
+*.whl
