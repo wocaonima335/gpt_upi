@@ -42,7 +42,73 @@ except ImportError:
 
 
 CHECKOUT_API = "https://chatgpt.com/backend-api/payments/checkout"
-PLAN_TYPE_MAP = {"plus": "chatgptplusplan", "team": "chatgptteamplan"}
+AUTH_SESSION_API = "https://chatgpt.com/api/auth/session"
+PLAN_TYPE_MAP = {"plus": "chatgptplusplan", "team": "chatgptteamplan", "go": "chatgptgoplan"}
+PROXY_REGION_CHECK_ATTEMPTS = 2
+PROXY_PROBE_ENDPOINTS = ("https://ipwho.is/", "https://ipapi.co/json/", "https://api.myip.com")
+
+COUNTRY_CURRENCY = {
+    "AT": "EUR", "AU": "AUD", "BE": "EUR", "BR": "BRL", "CA": "CAD", "CH": "CHF",
+    "CZ": "CZK", "DE": "EUR", "DK": "DKK", "ES": "EUR", "FI": "EUR", "FR": "EUR",
+    "GB": "GBP", "HK": "HKD", "ID": "IDR", "IE": "EUR", "IN": "INR", "IT": "EUR",
+    "JP": "JPY", "KR": "KRW", "MX": "MXN", "MY": "MYR", "NL": "EUR", "NO": "NOK",
+    "NZ": "NZD", "PH": "PHP", "PL": "PLN", "PT": "EUR", "SE": "SEK", "SG": "SGD",
+    "TH": "THB", "TW": "TWD", "US": "USD", "VN": "VND",
+}
+COUNTRY_TIMEZONE = {
+    "AT": "Europe/Vienna", "AU": "Australia/Sydney", "BE": "Europe/Brussels",
+    "BR": "America/Sao_Paulo", "CA": "America/Toronto", "CH": "Europe/Zurich",
+    "CZ": "Europe/Prague", "DE": "Europe/Berlin", "DK": "Europe/Copenhagen",
+    "ES": "Europe/Madrid", "FI": "Europe/Helsinki", "FR": "Europe/Paris",
+    "GB": "Europe/London", "HK": "Asia/Hong_Kong", "ID": "Asia/Jakarta",
+    "IE": "Europe/Dublin", "IN": "Asia/Kolkata", "IT": "Europe/Rome",
+    "JP": "Asia/Tokyo", "KR": "Asia/Seoul", "MX": "America/Mexico_City",
+    "MY": "Asia/Kuala_Lumpur", "NL": "Europe/Amsterdam", "NO": "Europe/Oslo",
+    "NZ": "Pacific/Auckland", "PH": "Asia/Manila", "PL": "Europe/Warsaw",
+    "PT": "Europe/Lisbon", "SE": "Europe/Stockholm", "SG": "Asia/Singapore",
+    "TH": "Asia/Bangkok", "TW": "Asia/Taipei", "US": "America/New_York",
+    "VN": "Asia/Ho_Chi_Minh",
+}
+REGION_LOCALE = {
+    "DE": ("de-DE", "de"), "ES": ("es-ES", "es"), "FR": ("fr-FR", "fr"),
+    "ID": ("id-ID", "id"), "IT": ("it-IT", "it"), "JP": ("ja-JP", "ja"),
+    "KR": ("ko-KR", "ko"), "BR": ("pt-BR", "pt-BR"), "CN": ("zh-CN", "zh-CN"),
+    "TW": ("zh-TW", "zh-TW"), "HK": ("zh-TW", "zh-TW"),
+    "US": ("en-US", "en"), "GB": ("en-GB", "en"), "NL": ("nl-NL", "nl"),
+    "IN": ("en-IN", "en"), "VN": ("vi-VN", "vi"),
+}
+
+# Payment-method → required provider exit region
+PROVIDER_REGION_MAP = {
+    "upi": "IN", "gopay": "ID", "ideal": "NL", "paypal": "US",
+    "card": "US", "hosted": "",
+}
+
+# Parallel/sequential proxy strategy matrix: (label, checkout, provider, approve)
+PROXY_STRATEGIES = (
+    ("US→US", "US", "US", ""),
+    ("JP→US", "JP", "US", ""),
+    ("JP→JP", "JP", "same", ""),
+    ("US→JP", "US", "JP", ""),
+    ("JP→US→JP", "JP", "US", "JP"),
+)
+
+MATRIX_STRATEGIES = tuple(
+    (f"{c}->{p}->{a}", c, p, a)
+    for c in ("US", "JP")
+    for p in ("US", "JP")
+    for a in ("US", "JP")
+)
+
+
+def billing_preset(country: str) -> dict:
+    country = (country or "IN").upper()
+    return {
+        "country": country,
+        "currency": COUNTRY_CURRENCY.get(country, "USD"),
+        "timezone": COUNTRY_TIMEZONE.get(country, "America/New_York"),
+        "locale": REGION_LOCALE.get(country, ("en-US", "en"))[0],
+    }
 
 
 class PersonPool:
@@ -161,37 +227,76 @@ class ChatGPTCheckout:
             ),
         }
 
+    @staticmethod
+    def _do_request(method, url, proxy, **kwargs):
+        if curl_requests is not None:
+            req_kwargs = {"impersonate": "chrome136", "timeout": 30}
+            req_kwargs.update(kwargs)
+            if proxy:
+                req_kwargs["proxies"] = {"http": proxy, "https": proxy}
+            return getattr(curl_requests, method)(url, **req_kwargs)
+        else:
+            req_kwargs = {"timeout": 30}
+            req_kwargs.update(kwargs)
+            if proxy:
+                req_kwargs["proxies"] = {"http": proxy, "https": proxy}
+            return getattr(requests, method)(url, **req_kwargs)
+
     @classmethod
-    def create(cls, token: str, proxy: str = "", plan: str = "plus") -> dict:
+    def refresh_access_token(cls, session_token: str, proxy: str = "") -> Optional[str]:
+        """用 sessionToken (cookie) 刷新获取新的 accessToken。
+        调用 GET /api/auth/session，返回 accessToken 或 None。"""
+        if not session_token:
+            return None
+        try:
+            resp = cls._do_request(
+                "get", AUTH_SESSION_API, proxy,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/136.0.0.0 Safari/537.36"
+                    ),
+                },
+                cookies={"__Secure-next-auth.session-token": session_token},
+            )
+            if resp.status_code != 200:
+                print(f"[!] /api/auth/session 返回 {resp.status_code}")
+                return None
+            data = resp.json() if callable(resp.json) else json.loads(resp.text)
+            token = data.get("accessToken") or ""
+            if token:
+                email = data.get("user", {}).get("email", "")
+                print(f"[OK] Token 刷新成功 ({email})")
+            return token or None
+        except Exception as exc:
+            print(f"[!] Token 刷新异常: {exc}")
+            return None
+
+    @classmethod
+    def create(cls, token: str, proxy: str = "", plan: str = "plus",
+               billing_region: str = "IN", session_token: str = "",
+               currency_override: str = "") -> dict:
+        billing = billing_preset(billing_region)
+        currency = (currency_override or billing["currency"]).upper()
         payload = {
             "plan_name": PLAN_TYPE_MAP.get(plan, "chatgptplusplan"),
-            "billing_details": {"country": "IN", "currency": "INR"},
+            "billing_details": {"country": billing["country"], "currency": currency},
             "checkout_ui_mode": "hosted",
             "cancel_url": "https://chatgpt.com/#pricing",
         }
 
-        if curl_requests is not None and proxy:
-            proxies = {"http": proxy, "https": proxy}
-            resp = curl_requests.post(
-                CHECKOUT_API, json=payload,
-                headers=cls._request_headers(token),
-                impersonate="chrome136",
-                proxies=proxies,
-                timeout=30,
-            )
-        elif curl_requests is not None:
-            resp = curl_requests.post(
-                CHECKOUT_API, json=payload,
-                headers=cls._request_headers(token),
-                impersonate="chrome136",
-                timeout=30,
-            )
-        else:
-            resp = requests.post(
-                CHECKOUT_API, json=payload,
-                headers=cls._request_headers(token),
-                timeout=30,
-            )
+        cookies = None
+        if session_token:
+            cookies = {"__Secure-next-auth.session-token": session_token}
+
+        resp = cls._do_request(
+            "post", CHECKOUT_API, proxy,
+            json=payload,
+            headers=cls._request_headers(token),
+            cookies=cookies,
+        )
 
         if resp.status_code != 200:
             text = resp.text[:800]
@@ -211,9 +316,79 @@ class ChatGPTCheckout:
     @staticmethod
     def _enrich(data: dict) -> dict:
         session_id = data.get("checkout_session_id") or data.get("session_id") or ""
-        if session_id and not data.get("url"):
-            data["url"] = f"https://pay.openai.com/c/pay/{session_id}"
+        publishable_key = data.get("publishable_key") or ""
+        if session_id:
+            url = f"https://pay.openai.com/c/pay/{session_id}"
+            client_secret = data.get("client_secret") or ""
+            if client_secret and "_secret_" in client_secret:
+                hash_data = client_secret.split("_secret_", 1)[1]
+                if hash_data:
+                    url += f"#{hash_data}"
+            data["url"] = url
         return data
+
+    @staticmethod
+    def stripe_init(session_id: str, publishable_key: str, proxy: str = "",
+                    timezone: str = "Asia/Kolkata",
+                    locale: str = "en-US") -> Optional[str]:
+        """Step 2: POST https://api.stripe.com/v1/payment_pages/{cs_id}/init
+        Returns stripe_hosted_url (the REAL working hosted checkout URL)."""
+        if not session_id or not publishable_key:
+            return None
+        init_url = f"https://api.stripe.com/v1/payment_pages/{session_id}/init"
+        form_data = {
+            "key": publishable_key,
+            "browser_locale": locale,
+            "browser_timezone": timezone,
+            "_stripe_version": "2025-06-30.basil",
+        }
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://js.stripe.com",
+            "Referer": "https://js.stripe.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            ),
+        }
+        try:
+            if curl_requests is not None and proxy:
+                resp = curl_requests.post(
+                    init_url, data=form_data, headers=headers,
+                    impersonate="chrome136",
+                    proxies={"http": proxy, "https": proxy},
+                    timeout=20,
+                )
+            elif curl_requests is not None:
+                resp = curl_requests.post(
+                    init_url, data=form_data, headers=headers,
+                    impersonate="chrome136", timeout=20,
+                )
+            else:
+                resp = requests.post(init_url, data=form_data, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                print(f"[!] Stripe init 返回 {resp.status_code}: {resp.text[:200]}")
+                return None
+            data = resp.json() if callable(resp.json) else json.loads(resp.text)
+            hosted = data.get("stripe_hosted_url") or data.get("hosted_url") or ""
+            if not hosted:
+                for k, v in data.items():
+                    if isinstance(v, str) and ("checkout.stripe.com" in v or "pay.openai.com" in v):
+                        hosted = v
+                        break
+            return hosted if hosted else None
+        except Exception as exc:
+            print(f"[!] Stripe init 异常: {exc}")
+            return None
+
+    @staticmethod
+    def to_openai_pay_url(url: str) -> str:
+        """Step 3: checkout.stripe.com -> pay.openai.com"""
+        if url.startswith("https://checkout.stripe.com"):
+            return "https://pay.openai.com" + url[len("https://checkout.stripe.com"):]
+        return url
 
 
 class StripeBrowserAutomator:
@@ -534,13 +709,19 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     g = p.add_mutually_exclusive_group()
     g.add_argument("--token-from-file", "-f", metavar="PATH",
-                   help="从 session JSON 文件读取 accessToken")
+                   help="从 session JSON 文件读取 accessToken 和 sessionToken")
     g.add_argument("--token", "-t", metavar="JWT",
                    help="直接传入 accessToken 字符串")
-    p.add_argument("--plan", choices=["plus", "team"], default="plus",
+    p.add_argument("--plan", choices=["plus", "team", "go"], default="plus",
                    help="订阅计划 (默认: plus)")
+    p.add_argument("--billing", default="IN",
+                   help="账单地区国家代码 (如 IN/US/JP/NL/DE/GB/ID 等, 默认: IN)")
+    p.add_argument("--currency", default="",
+                   help="覆盖币种 (如 USD/INR/EUR/JPY, 默认按地区自动选择)")
     p.add_argument("--proxy", default="",
                    help="HTTP(S) 代理地址，如 http://127.0.0.1:7890")
+    p.add_argument("--no-refresh", action="store_true",
+                   help="跳过 sessionToken 刷新，直接用 accessToken")
     p.add_argument("--headless", action="store_true", default=False,
                    help="无头模式运行浏览器 (默认: 有头，可观察)")
     p.add_argument("--no-browser", action="store_true",
@@ -596,10 +777,24 @@ def main():
     user_name = account.get("user", {}).get("name", "")
     user_email = account.get("user", {}).get("email", "")
     plan_type = account.get("account", {}).get("planType", "")
+    session_token = account.get("sessionToken") or account.get("session_token") or ""
     if user_name or user_email:
         print(f"[*] 账户: {user_name or '(unknown)'} <{user_email or '(no email)'}>  当前计划: {plan_type or '?'}")
 
     proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
+
+    # ================================================
+    # 1b. 用 sessionToken 刷新获取新的 accessToken (避免 401)
+    # ================================================
+    if session_token and not args.no_refresh:
+        print("[*] 用 sessionToken 刷新 accessToken...")
+        new_token = ChatGPTCheckout.refresh_access_token(session_token, proxy)
+        if new_token:
+            token = new_token
+        else:
+            print("[!] 刷新失败，使用原始 accessToken 继续...")
+    elif not session_token:
+        print("[*] 无 sessionToken，直接使用 accessToken (可能遇到 401)")
 
     # ================================================
     # 2. 生成虚拟人物 + 创建 checkout session
@@ -619,25 +814,53 @@ def main():
             sess = None
 
     if sess:
-        pay_url = sess.get("url", "")
-        if not pay_url or "cs_live_" not in pay_url:
+        hosted_url = sess.get("hosted_long_url", "")
+        if not hosted_url or "cs_live_" not in hosted_url:
             print("[!] 缓存的 session 无效，重新创建...")
             sess = None
 
     if sess is None:
-        print(f"[*] 调用 ChatGPT API 创建 checkout session (plan={args.plan})...")
+        print(f"[*] 调用 ChatGPT API 创建 checkout session (plan={args.plan}, billing={args.billing}, currency={args.currency or 'auto'})...")
         try:
-            sess = ChatGPTCheckout.create(token, proxy, plan=args.plan)
+            sess = ChatGPTCheckout.create(
+                token, proxy, plan=args.plan,
+                billing_region=args.billing,
+                currency_override=args.currency,
+                session_token=session_token,
+            )
         except Exception as exc:
             print(f"[!] 创建 checkout session 失败: {exc}")
             sys.exit(1)
         saved_session.write_text(json.dumps(sess, indent=2), encoding="utf-8")
 
-    pay_url = sess.get("url", "")
     session_id = sess.get("checkout_session_id") or sess.get("session_id") or ""
-    print(f"[*] 支付链接: {pay_url}")
-    if session_id:
-        print(f"[*] Session ID: {session_id}")
+    publishable_key = sess.get("publishable_key") or ""
+    short_url = sess.get("url", "")
+    print(f"[*] Session ID: {session_id}")
+    if short_url:
+        print(f"[*] 短链 (fallback): {short_url}")
+
+    # Step 2: Stripe init → 拿真正的 hosted_url (长链, 400字符 hash)
+    pay_url = short_url
+    if session_id and publishable_key:
+        billing = billing_preset(args.billing)
+        print("[*] 调用 Stripe init 获取 hosted checkout URL...")
+        hosted = ChatGPTCheckout.stripe_init(
+            session_id, publishable_key, proxy,
+            timezone=billing["timezone"],
+            locale=billing["locale"],
+        )
+        if hosted:
+            long_url = ChatGPTCheckout.to_openai_pay_url(hosted)
+            hash_len = len(hosted.split("#", 1)[1]) if "#" in hosted else 0
+            print(f"[OK] hosted 长链 (hash={hash_len}字符): {long_url}")
+            pay_url = long_url
+            sess["hosted_long_url"] = long_url
+            saved_session.write_text(json.dumps(sess, indent=2), encoding="utf-8")
+        else:
+            print("[!] Stripe init 失败，使用短链 fallback")
+    else:
+        print("[!] 缺少 session_id 或 publishable_key，使用短链 fallback")
 
     # --no-browser: 只输出链接，不启动浏览器
     if args.no_browser:

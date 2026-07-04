@@ -35,6 +35,49 @@ PORT = 7791
 CHECKOUT_API = "https://chatgpt.com/backend-api/payments/checkout"
 WORK_DIR = Path(__file__).parent
 
+COUNTRY_CURRENCY = {
+    "AT": "EUR", "AU": "AUD", "BE": "EUR", "BR": "BRL", "CA": "CAD", "CH": "CHF",
+    "CZ": "CZK", "DE": "EUR", "DK": "DKK", "ES": "EUR", "FI": "EUR", "FR": "EUR",
+    "GB": "GBP", "HK": "HKD", "ID": "IDR", "IE": "EUR", "IN": "INR", "IT": "EUR",
+    "JP": "JPY", "KR": "KRW", "MX": "MXN", "MY": "MYR", "NL": "EUR", "NO": "NOK",
+    "NZ": "NZD", "PH": "PHP", "PL": "PLN", "PT": "EUR", "SE": "SEK", "SG": "SGD",
+    "TH": "THB", "TW": "TWD", "US": "USD", "VN": "VND",
+}
+COUNTRY_TIMEZONE = {
+    "AT": "Europe/Vienna", "AU": "Australia/Sydney", "BE": "Europe/Brussels",
+    "BR": "America/Sao_Paulo", "CA": "America/Toronto", "CH": "Europe/Zurich",
+    "CZ": "Europe/Prague", "DE": "Europe/Berlin", "DK": "Europe/Copenhagen",
+    "ES": "Europe/Madrid", "FI": "Europe/Helsinki", "FR": "Europe/Paris",
+    "GB": "Europe/London", "HK": "Asia/Hong_Kong", "ID": "Asia/Jakarta",
+    "IE": "Europe/Dublin", "IN": "Asia/Kolkata", "IT": "Europe/Rome",
+    "JP": "Asia/Tokyo", "KR": "Asia/Seoul", "MX": "America/Mexico_City",
+    "MY": "Asia/Kuala_Lumpur", "NL": "Europe/Amsterdam", "NO": "Europe/Oslo",
+    "NZ": "Pacific/Auckland", "PH": "Asia/Manila", "PL": "Europe/Warsaw",
+    "PT": "Europe/Lisbon", "SE": "Europe/Stockholm", "SG": "Asia/Singapore",
+    "TH": "Asia/Bangkok", "TW": "Asia/Taipei", "US": "America/New_York",
+    "VN": "Asia/Ho_Chi_Minh",
+}
+COUNTRY_LABELS = [
+    ("IN", "印度 IN"), ("US", "美国 US"), ("JP", "日本 JP"), ("NL", "荷兰 NL"),
+    ("DE", "德国 DE"), ("FR", "法国 FR"), ("GB", "英国 GB"), ("ID", "印尼 ID"),
+    ("BR", "巴西 BR"), ("CA", "加拿大 CA"), ("AU", "澳大利亚 AU"), ("KR", "韩国 KR"),
+    ("SG", "新加坡 SG"), ("HK", "香港 HK"), ("TW", "台湾 TW"), ("VN", "越南 VN"),
+    ("MX", "墨西哥 MX"), ("TH", "泰国 TH"), ("MY", "马来 MY"), ("PH", "菲律宾 PH"),
+    ("CH", "瑞士 CH"), ("SE", "瑞典 SE"), ("NO", "挪威 NO"), ("DK", "丹麦 DK"),
+    ("PL", "波兰 PL"), ("CZ", "捷克 CZ"), ("AT", "奥地利 AT"), ("BE", "比利时 BE"),
+    ("FI", "芬兰 FI"), ("IE", "爱尔兰 IE"), ("IT", "意大利 IT"), ("PT", "葡萄牙 PT"),
+    ("ES", "西班牙 ES"), ("NZ", "新西兰 NZ"),
+]
+
+
+def billing_preset(country: str) -> dict:
+    country = (country or "IN").upper()
+    return {
+        "country": country,
+        "currency": COUNTRY_CURRENCY.get(country, "USD"),
+        "timezone": COUNTRY_TIMEZONE.get(country, "America/New_York"),
+    }
+
 
 # =============================================================================
 # PersonPool (from get_qr_code.py)
@@ -123,10 +166,14 @@ class PersonPool:
 # Checkout API (from server.py)
 # =============================================================================
 
-def _create_checkout(token: str, proxy: str = "") -> dict:
+def _create_checkout(token: str, proxy: str = "", country: str = "IN",
+                     currency: str = "", session_token: str = "") -> dict:
+    preset = billing_preset(country)
+    billing_country = preset["country"]
+    billing_currency = (currency or preset["currency"]).upper()
     payload = {
         "plan_name": "chatgptplusplan",
-        "billing_details": {"country": "IN", "currency": "INR"},
+        "billing_details": {"country": billing_country, "currency": billing_currency},
         "checkout_ui_mode": "hosted",
         "cancel_url": "https://chatgpt.com/#pricing",
     }
@@ -143,11 +190,13 @@ def _create_checkout(token: str, proxy: str = "") -> dict:
             "Chrome/136.0.0.0 Safari/537.36"
         ),
     }
+    cookies = {"__Secure-next-auth.session-token": session_token} if session_token else None
 
     if curl_requests is not None:
         proxies = {"http": proxy, "https": proxy} if proxy else None
         resp = curl_requests.post(CHECKOUT_API, json=payload, headers=headers,
-                                  impersonate="chrome136", proxies=proxies, timeout=30)
+                                  impersonate="chrome136", proxies=proxies,
+                                  cookies=cookies, timeout=30)
         status = resp.status_code
         text = resp.text
         try:
@@ -156,8 +205,11 @@ def _create_checkout(token: str, proxy: str = "") -> dict:
             data = {"error": text}
     else:
         try:
+            req_headers = dict(headers)
+            if cookies:
+                req_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
             req = urllib.request.Request(CHECKOUT_API, data=json.dumps(payload).encode("utf-8"),
-                                         headers=headers, method="POST")
+                                         headers=req_headers, method="POST")
             with urllib.request.urlopen(req, timeout=15) as resp:
                 status = resp.getcode()
                 text = resp.read().decode("utf-8", errors="replace")
@@ -459,6 +511,20 @@ button, .btn { display:inline-flex; align-items:center; gap:6px;
         手动提供支付链接 (跳过 API，直接填 cs_live_xxx)
       </label>
     </div>
+
+    <div class="settings" id="billingGroup">
+      <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
+        <div style="flex:1; min-width:160px;">
+          <label for="country" style="margin:0 0 4px;">地区 / Region</label>
+          <select id="country" style="width:100%;box-sizing:border-box;border:1px solid var(--border);border-radius:8px;padding:10px;background:#0d1117;color:var(--text);font:13px inherit;"></select>
+        </div>
+        <div style="flex:1; min-width:120px;">
+          <label for="currency" style="margin:0 0 4px;">币种 / Currency</label>
+          <input id="currency" value="INR" maxlength="3" style="width:100%;box-sizing:border-box;border:1px solid var(--border);border-radius:8px;padding:10px;background:#0d1117;color:var(--text);font:13px monospace;text-transform:uppercase;" />
+        </div>
+      </div>
+    </div>
+
     <div id="manualUrlGroup" style="display:none; margin-top:8px;">
       <input id="manualPayUrl" placeholder="粘贴 pay.openai.com/c/pay/cs_live_xxx 完整链接" style="width:100%;box-sizing:border-box;border:1px solid var(--border);border-radius:8px;padding:10px;font:13px monospace;background:#0d1117;color:var(--text);" />
     </div>
@@ -515,6 +581,44 @@ const $ = id => document.getElementById(id);
 
 let currentB64 = '';
 
+const COUNTRY_CURRENCY = {
+  "AT":"EUR","AU":"AUD","BE":"EUR","BR":"BRL","CA":"CAD","CH":"CHF",
+  "CZ":"CZK","DE":"EUR","DK":"DKK","ES":"EUR","FI":"EUR","FR":"EUR",
+  "GB":"GBP","HK":"HKD","ID":"IDR","IE":"EUR","IN":"INR","IT":"EUR",
+  "JP":"JPY","KR":"KRW","MX":"MXN","MY":"MYR","NL":"EUR","NO":"NOK",
+  "NZ":"NZD","PH":"PHP","PL":"PLN","PT":"EUR","SE":"SEK","SG":"SGD",
+  "TH":"THB","TW":"TWD","US":"USD","VN":"VND"
+};
+const COUNTRY_LABELS = [
+  ["IN","印度 IN"],["US","美国 US"],["JP","日本 JP"],["NL","荷兰 NL"],
+  ["DE","德国 DE"],["FR","法国 FR"],["GB","英国 GB"],["ID","印尼 ID"],
+  ["BR","巴西 BR"],["CA","加拿大 CA"],["AU","澳大利亚 AU"],["KR","韩国 KR"],
+  ["SG","新加坡 SG"],["HK","香港 HK"],["TW","台湾 TW"],["VN","越南 VN"],
+  ["MX","墨西哥 MX"],["TH","泰国 TH"],["MY","马来 MY"],["PH","菲律宾 PH"],
+  ["CH","瑞士 CH"],["SE","瑞典 SE"],["NO","挪威 NO"],["DK","丹麦 DK"],
+  ["PL","波兰 PL"],["CZ","捷克 CZ"],["AT","奥地利 AT"],["BE","比利时 BE"],
+  ["FI","芬兰 FI"],["IE","爱尔兰 IE"],["IT","意大利 IT"],["PT","葡萄牙 PT"],
+  ["ES","西班牙 ES"],["NZ","新西兰 NZ"]
+];
+
+(function initCountrySelect() {
+  const sel = $('country');
+  for (const [code, label] of COUNTRY_LABELS) {
+    const opt = document.createElement('option');
+    opt.value = code; opt.textContent = label;
+    sel.appendChild(opt);
+  }
+  sel.value = 'IN';
+  updateCurrencyForCountry();
+})();
+
+function updateCurrencyForCountry() {
+  const c = $('country').value.trim().toUpperCase();
+  $('currency').value = COUNTRY_CURRENCY[c] || 'USD';
+}
+
+$('country').addEventListener('change', updateCurrencyForCountry);
+
 function updateHint() {
   let raw = $('jsonInput').value.trim();
   let h = '';
@@ -562,6 +666,7 @@ $('jsonInput').addEventListener('input', updateHint);
 
 $('manualSession').addEventListener('change', function() {
   $('manualUrlGroup').style.display = this.checked ? 'block' : 'none';
+  $('billingGroup').style.display = this.checked ? 'none' : 'flex';
   $('jsonInput').style.display = this.checked ? 'none' : '';
 });
 
@@ -574,7 +679,12 @@ $('goBtn').addEventListener('click', async () => {
   $('downloadBtn').disabled = true;
   currentB64 = '';
 
-  let payload = { reuse_session: $('reuseSession').checked, proxy: '' };
+  let payload = {
+    reuse_session: $('reuseSession').checked,
+    proxy: '',
+    country: $('country').value.trim().toUpperCase(),
+    currency: $('currency').value.trim().toUpperCase(),
+  };
   if (manualMode) {
     let url = ($('manualPayUrl').value || '').trim();
     if (!url || !url.includes('cs_live_')) { showToast('请填写有效的支付链接', 'error'); resetBtn(); return; }
@@ -756,6 +866,8 @@ class Handler(BaseHTTPRequestHandler):
             pay_url_manual = body.get("pay_url", "").strip()
             proxy = body.get("proxy", "")
             reuse = bool(body.get("reuse_session", True))
+            country = (body.get("country") or "IN").strip().upper()
+            currency = (body.get("currency") or "").strip().upper()
 
             def prog(step: str, msg: str = ""):
                 if sse:
@@ -789,12 +901,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 account = parse_account(raw)
                 token, user_name, user_email = extract_info(account)
+                session_token = account.get("sessionToken") or account.get("session_token") or ""
                 if not token:
                     fail("parse", "未识别到 accessToken")
                 if curl_requests is None:
                     fail("session", "curl_cffi 未安装，请使用手动链接模式")
 
-                prog("session", "调用 ChatGPT API 创建支付会话...")
+                preset = billing_preset(country)
+                prog("session", f"调用 ChatGPT API 创建支付会话 (地区={preset['country']}, 币种={currency or preset['currency']})...")
                 cache_file = WORK_DIR / "__checkout_session.json"
 
                 if reuse and cache_file.exists():
@@ -809,7 +923,8 @@ class Handler(BaseHTTPRequestHandler):
                     sess = None
 
                 if sess is None:
-                    sess = _create_checkout(token, proxy)
+                    sess = _create_checkout(token, proxy, country=country,
+                                            currency=currency, session_token=session_token)
                     cache_file.write_text(json.dumps(sess, indent=2))
                     prog("session", "支付会话已创建")
 
