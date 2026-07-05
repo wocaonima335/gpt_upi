@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 
 
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 7790
 CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
 IP_CHECK_URLS = (
@@ -581,12 +581,13 @@ def _request_headers(token):
         "Accept": "application/json",
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.0.0 Safari/537.36"
-        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
     }
 
 

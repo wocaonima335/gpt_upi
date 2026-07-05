@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 7791
 CHECKOUT_API = "https://chatgpt.com/backend-api/payments/checkout"
 WORK_DIR = Path(__file__).parent
@@ -183,12 +183,13 @@ def _create_checkout(token: str, proxy: str = "", country: str = "IN",
         "Accept": "application/json",
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.0.0 Safari/537.36"
-        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
     }
     cookies = {"__Secure-next-auth.session-token": session_token} if session_token else None
 
@@ -243,12 +244,12 @@ def _create_checkout(token: str, proxy: str = "", country: str = "IN",
 # Playwright QR Extraction
 # =============================================================================
 
-def _extract_qr_via_browser(pay_url: str, person: dict) -> bytes:
-    return _extract_qr_via_browser_sse(pay_url, person, lambda *a: None, lambda s, m: (_ for _ in ()).throw(RuntimeError(m)))
+def _extract_qr_via_browser(pay_url: str, person: dict, proxy: str = "") -> bytes:
+    return _extract_qr_via_browser_sse(pay_url, person, lambda *a: None, lambda s, m: (_ for _ in ()).throw(RuntimeError(m)), proxy)
 
 
 def _extract_qr_via_browser_sse(pay_url: str, person: dict,
-                                 prog, err) -> bytes:
+                                 prog, err, proxy: str = "") -> bytes:
     if not HAS_PLAYWRIGHT:
         raise ImportError("playwright 未安装")
 
@@ -261,14 +262,22 @@ def _extract_qr_via_browser_sse(pay_url: str, person: dict,
             channel="chrome",
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
         )
-        ctx = browser.new_context(
-            user_agent=(
+        ctx_kwargs = {
+            "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/136.0.0.0 Safari/537.36"
             ),
-            locale="en-IN",
-        )
+            "locale": "en-IN",
+        }
+        if proxy:
+            parsed = urllib.parse.urlparse(proxy)
+            pw_cfg = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 7890}"}
+            if parsed.username:
+                pw_cfg["username"] = parsed.username
+                pw_cfg["password"] = parsed.password or ""
+            ctx_kwargs["proxy"] = pw_cfg
+        ctx = browser.new_context(**ctx_kwargs)
         page = ctx.new_page()
 
         def on_route(route):
@@ -525,6 +534,9 @@ button, .btn { display:inline-flex; align-items:center; gap:6px;
       </div>
     </div>
 
+    <div style="margin-top:8px">
+      <input id="proxyInput" placeholder="代理 (可选): http://127.0.0.1:7890" style="width:100%;box-sizing:border-box;border:1px solid var(--border);border-radius:8px;padding:8px;font:12px monospace;background:#0d1117;color:var(--text);" />
+    </div>
     <div id="manualUrlGroup" style="display:none; margin-top:8px;">
       <input id="manualPayUrl" placeholder="粘贴 pay.openai.com/c/pay/cs_live_xxx 完整链接" style="width:100%;box-sizing:border-box;border:1px solid var(--border);border-radius:8px;padding:10px;font:13px monospace;background:#0d1117;color:var(--text);" />
     </div>
@@ -681,7 +693,7 @@ $('goBtn').addEventListener('click', async () => {
 
   let payload = {
     reuse_session: $('reuseSession').checked,
-    proxy: '',
+    proxy: ($('proxyInput').value || '').trim(),
     country: $('country').value.trim().toUpperCase(),
     currency: $('currency').value.trim().toUpperCase(),
   };
@@ -933,7 +945,7 @@ class Handler(BaseHTTPRequestHandler):
                     fail("session", "未能获取有效支付链接")
 
             # ---- Browser + QR ----
-            qr_bytes = _extract_qr_via_browser_sse(pay_url, person, prog, fail)
+            qr_bytes = _extract_qr_via_browser_sse(pay_url, person, prog, fail, proxy)
             qr_b64 = base64.b64encode(qr_bytes).decode("utf-8")
             prog("qr", f"QR 码已提取 ({len(qr_bytes)} bytes)")
 
